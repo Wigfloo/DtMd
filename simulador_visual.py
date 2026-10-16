@@ -3,8 +3,54 @@ from fastapi.responses import HTMLResponse
 import math
 import time
 import random
+import json
+from datetime import datetime, timezone
+import paho.mqtt.client as mqtt
 
 app = FastAPI()
+
+# --- CONFIGURACIÓN MQTT ROBUSTA (CON RECONEXIÓN DINÁMICA) ---
+MQTT_BROKER_IP = "jetson.local"
+MQTT_PORT = 1883
+MQTT_TOPIC_DETECTIONS = "surveillance/detections"
+MQTT_TOPIC_TELEMETRY = "surveillance/telemetry"
+
+mqtt_conectado = False
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    global mqtt_conectado
+    if rc == 0:
+        mqtt_conectado = True
+        print(f"✅ MQTT: Conectado exitosamente al broker en {MQTT_BROKER_IP}:{MQTT_PORT}")
+    else:
+        mqtt_conectado = False
+        print(f"❌ MQTT: Fallo de conexión con código {rc}")
+
+def on_disconnect(client, userdata, rc, properties=None):
+    global mqtt_conectado
+    mqtt_conectado = False
+    print("⚠️ MQTT: Desconectado del broker. Intentando reconectar automáticamente...")
+
+# Compatibilidad para paho-mqtt v1 y v2
+try:
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+except AttributeError:
+    mqtt_client = mqtt.Client()
+
+mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
+
+try:
+    mqtt_client.connect_async(MQTT_BROKER_IP, MQTT_PORT, 60)
+    mqtt_client.loop_start()
+except Exception as e:
+    print(f"⚠️ MQTT Error inicial con {MQTT_BROKER_IP}: {e}")
+
+def publicar_mqtt(topic, payload):
+    if mqtt_conectado:
+        res = mqtt_client.publish(topic, json.dumps(payload))
+        if res.rc != mqtt.MQTT_ERR_SUCCESS:
+            print(f"⚠️ Error al publicar evento en {topic}: {res.rc}")
 
 # --- CONFIGURACIÓN DEL ESCENARIO ---
 LAT_CENTRO = 7.128606
@@ -17,14 +63,17 @@ LON_FIN = -73.180000
 
 DURACION_VUELO = 30.0
 
-# Memoria de estado del servidor
+PISO_RUIDO_RF_BASE = -95.0     # dBm
+PISO_RUIDO_AUDIO_BASE = 45.0  # dB SPL
+
 estado = {
     "tiempo_inicio": 0,
     "tipo_dron": "RF",
     "volando": False,
     "ultimo_check": 0,
     "radar_angulo": 0,
-    "radar_memoria": {"detectado": False, "distancia": 0, "azimut": 0, "timestamp": 0}
+    "radar_memoria": [],
+    "ave": {"activa": False, "lat": 0.0, "lon": 0.0, "siguiente_aparicion": 0}
 }
 
 def calcular_distancia(lat1, lon1, lat2, lon2):
@@ -39,86 +88,202 @@ def calcular_azimut(lat1, lon1, lat2, lon2):
     x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dLon)
     return (math.degrees(math.atan2(y, x)) + 360) % 360
 
+def actualizar_posicion_ave(t_actual):
+    if not estado["ave"]["activa"] and t_actual > estado["ave"]["siguiente_aparicion"]:
+        angulo = random.uniform(0, 2 * math.pi)
+        dist = random.uniform(20, 90)
+        dx = dist * math.cos(angulo)
+        dy = dist * math.sin(angulo)
+        estado["ave"]["lat"] = LAT_CENTRO + (dy / 111320)
+        estado["ave"]["lon"] = LON_CENTRO + (dx / (111320 * math.cos(math.radians(LAT_CENTRO))))
+        estado["ave"]["activa"] = True
+        estado["ave"]["siguiente_aparicion"] = t_actual + random.uniform(8, 15)
+        
+    elif estado["ave"]["activa"]:
+        estado["ave"]["lat"] += random.uniform(-0.00005, 0.00005)
+        estado["ave"]["lon"] += random.uniform(-0.00005, 0.00005)
+        if random.random() < 0.1:
+            estado["ave"]["activa"] = False
+
 @app.post("/iniciar/{tipo}")
 def iniciar_vuelo(tipo: str):
+    t_ahora = time.time()
     estado["tipo_dron"] = tipo
-    estado["tiempo_inicio"] = time.time()
-    estado["ultimo_check"] = time.time()
+    estado["tiempo_inicio"] = t_ahora
+    estado["ultimo_check"] = t_ahora
     estado["volando"] = True
-    estado["radar_memoria"]["detectado"] = False
+    estado["radar_memoria"] = []
+    estado["ave"]["siguiente_aparicion"] = t_ahora + random.uniform(2, 5)
     return {"status": "ok"}
 
 @app.get("/estado")
 def obtener_estado():
-    if not estado["volando"]:
-        return {"volando": False}
-    
     t_actual = time.time()
-    progreso = (t_actual - estado["tiempo_inicio"]) / DURACION_VUELO
+    actualizar_posicion_ave(t_actual)
+    timestamp_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     
+    rssi_ruido_fondo = round(PISO_RUIDO_RF_BASE + random.uniform(-2.5, 2.5), 1)
+    ruido_ambiente = round(PISO_RUIDO_AUDIO_BASE + random.uniform(-0.5, 0.5), 1)
+    eventos_json = []
+
+    if not estado["volando"]:
+        return {
+            "volando": False,
+            "ave": estado["ave"],
+            "sensores": {
+                "RF": {"rssi": rssi_ruido_fondo, "piso_ruido": PISO_RUIDO_RF_BASE},
+                "Radar": [],
+                "Audio": {"spl": ruido_ambiente, "ambiente": PISO_RUIDO_AUDIO_BASE, "detectado": False},
+                "Camara": []
+            },
+            "eventos": []
+        }
+    
+    progreso = (t_actual - estado["tiempo_inicio"]) / DURACION_VUELO
     if progreso >= 1.0:
         estado["volando"] = False
-        return {"volando": False}
+        return {"volando": False, "ave": estado["ave"]}
         
-    # 1. Cinemática
-    lat_actual = LAT_INICIO + (LAT_FIN - LAT_INICIO) * progreso
-    lon_actual = LON_INICIO + (LON_FIN - LON_INICIO) * progreso
-    dist_m = max(calcular_distancia(LAT_CENTRO, LON_CENTRO, lat_actual, lon_actual), 1.0)
-    azimut_dron = calcular_azimut(LAT_CENTRO, LON_CENTRO, lat_actual, lon_actual)
+    # --- Cinemática ---
+    lat_dron = LAT_INICIO + (LAT_FIN - LAT_INICIO) * progreso
+    lon_dron = LON_INICIO + (LON_FIN - LON_INICIO) * progreso
+    dist_dron = max(calcular_distancia(LAT_CENTRO, LON_CENTRO, lat_dron, lon_dron), 1.0)
+    azimut_dron = calcular_azimut(LAT_CENTRO, LON_CENTRO, lat_dron, lon_dron)
     
-    # 2. Modelo RF (FSPL 2.4GHz)
-    emite_rf = estado["tipo_dron"] == "RF"
-    fspl = 20 * math.log10(dist_m) + 40.05
-    rssi = round(20 - fspl + random.uniform(-1.5, 1.5), 1) if emite_rf else -120.0
-    rf_detectado = rssi >= -85.0
+    dist_ave = 9999.0
+    azimut_ave = 0.0
+    if estado["ave"]["activa"]:
+        dist_ave = calcular_distancia(LAT_CENTRO, LON_CENTRO, estado["ave"]["lat"], estado["ave"]["lon"])
+        azimut_ave = calcular_azimut(LAT_CENTRO, LON_CENTRO, estado["ave"]["lat"], estado["ave"]["lon"])
 
-    # 3. Modelo Radar (Barrido Rotatorio)
+    # --- Sensor RF ---
+    emite_rf = estado["tipo_dron"] == "RF"
+    rf_data_payload = None
+    if emite_rf:
+        fspl = 20 * math.log10(dist_dron) + 40.05
+        rssi_senal = 20 - fspl + random.uniform(-1.5, 1.5)
+        rssi_total = round(10 * math.log10(10**(rssi_senal/10) + 10**(rssi_ruido_fondo/10)), 1)
+    else:
+        rssi_total = rssi_ruido_fondo
+        
+    rf_detectado = rssi_total >= -85.0
+    if rf_detectado:
+        rf_data_payload = {"frequency_mhz": 2437.5, "rssi_dbm": rssi_total, "detected": True}
+        evento_rf = {
+            "object_id": f"UAV-{estado['tipo_dron']}-01",
+            "classification": "drone",
+            "timestamp": timestamp_iso,
+            "position": {"x": round(lon_dron, 6), "y": round(lat_dron, 6), "z": 30.0},
+            "source": {"sensor_id": "RF-01", "type": "rf_receiver"},
+            "rf_data": rf_data_payload
+        }
+        eventos_json.append(evento_rf)
+        publicar_mqtt(MQTT_TOPIC_DETECTIONS, evento_rf)
+
+    # --- Sensor Radar ---
     dt = t_actual - estado["ultimo_check"]
-    vel_radar = 120.0 # grados por segundo
+    vel_radar = 120.0 
     angulo_previo = estado["radar_angulo"]
     angulo_actual = (angulo_previo + dt * vel_radar) % 360
     
-    cruzó = False
-    if angulo_actual >= angulo_previo:
-        cruzó = angulo_previo <= azimut_dron <= angulo_actual
-    else:
-        cruzó = azimut_dron >= angulo_previo or azimut_dron <= angulo_actual
-        
-    if cruzó and dist_m <= 120.0:
-        estado["radar_memoria"] = {
-            "detectado": True,
-            "distancia": round(dist_m + random.uniform(-2, 2), 1),
-            "azimut": round(azimut_dron + random.uniform(-1, 1), 1),
-            "timestamp": t_actual
+    def haz_cruzo_objetivo(azimut_obj):
+        if angulo_actual >= angulo_previo:
+            return angulo_previo <= azimut_obj <= angulo_actual
+        return azimut_obj >= angulo_previo or azimut_obj <= angulo_actual
+
+    nuevos_ecos_radar = []
+    if haz_cruzo_objetivo(azimut_dron) and dist_dron <= 120.0:
+        eco = {"id": f"UAV-{estado['tipo_dron']}-01", "distancia": round(dist_dron, 1), "azimut": round(azimut_dron, 1), "timestamp": t_actual}
+        nuevos_ecos_radar.append(eco)
+        evento_radar = {
+            "object_id": eco["id"],
+            "classification": "unknown",
+            "timestamp": timestamp_iso,
+            "position": {"x": round(lon_dron, 6), "y": round(lat_dron, 6), "z": 30.0},
+            "source": {"sensor_id": "RDR-01", "type": "radar"}
         }
+        eventos_json.append(evento_radar)
+        publicar_mqtt(MQTT_TOPIC_DETECTIONS, evento_radar)
+
+    if estado["ave"]["activa"] and haz_cruzo_objetivo(azimut_ave) and dist_ave <= 120.0:
+        eco = {"id": "BIRD-UNKNOWN", "distancia": round(dist_ave, 1), "azimut": round(azimut_ave, 1), "timestamp": t_actual}
+        nuevos_ecos_radar.append(eco)
+        evento_radar = {
+            "object_id": eco["id"],
+            "classification": "unknown",
+            "timestamp": timestamp_iso,
+            "position": {"x": round(estado["ave"]["lon"], 6), "y": round(estado["ave"]["lat"], 6), "z": 15.0},
+            "source": {"sensor_id": "RDR-01", "type": "radar"}
+        }
+        eventos_json.append(evento_radar)
+        publicar_mqtt(MQTT_TOPIC_DETECTIONS, evento_radar)
+
+    estado["radar_memoria"].extend(nuevos_ecos_radar)
+    estado["radar_memoria"] = [eco for eco in estado["radar_memoria"] if t_actual - eco["timestamp"] <= 3.0]
     
-    # Expirar eco de radar si tiene más de 3 segundos (1 vuelta completa)
-    if t_actual - estado["radar_memoria"]["timestamp"] > 3.0:
-        estado["radar_memoria"]["detectado"] = False
-        
     estado["ultimo_check"] = t_actual
     estado["radar_angulo"] = angulo_actual
 
-    # 4. Modelo Acústico (SPL Atenuación)
-    ruido_ambiente = round(45.0 + random.uniform(-0.5, 0.5), 1)
-    spl_fuente = 90.0
-    spl_recibido = round(spl_fuente - 20 * math.log10(dist_m) + random.uniform(-1, 1), 1)
+    # --- Sensor Acústico ---
+    spl_recibido = 90.0 - 20 * math.log10(dist_dron) + random.uniform(-1, 1)
     spl_total = round(max(ruido_ambiente, spl_recibido), 1)
     audio_detectado = spl_total >= 48.0
-
-    # 5. Modelo Cámara
-    camara_detectado = dist_m <= 70.0
     
+    if audio_detectado:
+        evento_audio = {
+            "object_id": f"UAV-{estado['tipo_dron']}-01",
+            "classification": "drone",
+            "timestamp": timestamp_iso,
+            "position": {"x": round(lon_dron, 6), "y": round(lat_dron, 6), "z": 30.0},
+            "source": {"sensor_id": "MIC-01", "type": "acoustic"},
+            "acoustic_data": {
+                "spl_db": spl_total,
+                "ambient_noise_db": ruido_ambiente,
+                "detected": True
+            }
+        }
+        eventos_json.append(evento_audio)
+        publicar_mqtt(MQTT_TOPIC_DETECTIONS, evento_audio)
+
+    # --- Sensor Cámara ---
+    camara_detecciones = []
+    if dist_dron <= 70.0:
+        det_dron = {
+            "object_id": f"UAV-{estado['tipo_dron']}-01",
+            "classification": "drone",
+            "timestamp": timestamp_iso,
+            "position": {"x": round(lon_dron, 6), "y": round(lat_dron, 6), "z": 30.0},
+            "source": {"sensor_id": "CAM-01", "type": "camera"}
+        }
+        if rf_data_payload: det_dron["rf_data"] = rf_data_payload
+        camara_detecciones.append(det_dron)
+        eventos_json.append(det_dron)
+        publicar_mqtt(MQTT_TOPIC_DETECTIONS, det_dron)
+
+    if estado["ave"]["activa"] and dist_ave <= 70.0:
+        det_ave = {
+            "object_id": "BIRD-001",
+            "classification": "bird",
+            "timestamp": timestamp_iso,
+            "position": {"x": round(estado["ave"]["lon"], 6), "y": round(estado["ave"]["lat"], 6), "z": 15.0},
+            "source": {"sensor_id": "CAM-01", "type": "camera"}
+        }
+        camara_detecciones.append(det_ave)
+        eventos_json.append(det_ave)
+        publicar_mqtt(MQTT_TOPIC_DETECTIONS, det_ave)
+
     return {
         "volando": True,
-        "lat": round(lat_actual, 6),
-        "lon": round(lon_actual, 6),
+        "lat": round(lat_dron, 6),
+        "lon": round(lon_dron, 6),
+        "ave": estado["ave"],
         "sensores": {
-            "RF": {"detectado": rf_detectado, "rssi": rssi},
+            "RF": {"rssi": rssi_total, "piso_ruido": PISO_RUIDO_RF_BASE},
             "Radar": estado["radar_memoria"],
-            "Audio": {"detectado": audio_detectado, "spl": spl_total, "ambiente": ruido_ambiente},
-            "Camara": {"detectado": camara_detectado}
-        }
+            "Audio": {"spl": spl_total, "ambiente": ruido_ambiente, "detectado": audio_detectado},
+            "Camara": camara_detecciones
+        },
+        "eventos": eventos_json
     }
 
 # --- INTERFAZ WEB ---
@@ -128,7 +293,7 @@ def pagina_principal():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Simulador de Drones - Multisensor Avanzado</title>
+        <title>Simulador - Detección Multisensorial Restaurada</title>
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <style>
@@ -137,32 +302,35 @@ def pagina_principal():
             #panel { width: 30%; padding: 20px; background: #2c3e50; color: white; overflow-y: auto; }
             button { padding: 10px; width: 100%; margin-top: 10px; background: #27ae60; color: white; border: none; font-size: 16px; cursor: pointer;}
             select { padding: 10px; width: 100%; font-size: 16px; margin-top: 10px; }
-            .sensor { margin-top: 15px; padding: 15px; border-radius: 5px; background: #34495e; font-size: 14px; }
-            .detectado { background: #c0392b; font-weight: bold; }
-            .datos-sensor { color: #a2e9c1; font-family: monospace; margin-top: 5px; font-size: 13px; display: block; }
+            .sensor { margin-top: 15px; padding: 12px; border-radius: 5px; background: #34495e; font-size: 14px; }
+            .datos-estructurados { font-family: monospace; font-size: 12px; color: #a2e9c1; white-space: pre-wrap; margin-top: 5px; display: block;}
+            .highlight { color: #f1c40f; }
         </style>
     </head>
     <body>
         <div id="map"></div>
         <div id="panel">
-            <h2>Panel de Sensores</h2>
+            <h2>Datos de Sensores Estructurados</h2>
             <select id="tipoDron">
-                <option value="RF">Dron Comercial (Emisión RF 2.4GHz)</option>
+                <option value="RF">Dron Comercial (RF 2.4GHz)</option>
                 <option value="FIBRA">Dron Sigiloso (Fibra Óptica)</option>
             </select>
-            <button onclick="iniciarVuelo()">Iniciar Incursión Simulada</button>
+            <button onclick="iniciarVuelo()">Lanzar Dron</button>
             
-            <div id="s_rf" class="sensor">📡 Sensor RF 
-                <span id="data_rf" class="datos-sensor">Buscando señales...</span>
+            <div id="s_camara" class="sensor">📷 Clasificación de Cámara
+                <span id="data_camara" class="datos-estructurados">Esperando objetos...</span>
             </div>
-            <div id="s_radar" class="sensor">🛰️ Radar Rotatorio 
-                <span id="data_radar" class="datos-sensor">Escaneando espacio aéreo...</span>
+            <div id="s_audio" class="sensor">🎙️ Arreglo Acústico (Micrófonos)
+                <span id="data_audio" class="datos-estructurados">Monitoreando...</span>
             </div>
-            <div id="s_audio" class="sensor">🎙️ Arreglo Acústico 
-                <span id="data_audio" class="datos-sensor">Monitoreando SPL...</span>
+            <div id="s_rf" class="sensor">📡 Telemetría RF 
+                <span id="data_rf" class="datos-estructurados">Buscando...</span>
             </div>
-            <div id="s_camara" class="sensor">📷 Cámara 
-                <span id="data_camara" class="datos-sensor">FOV Despejado</span>
+            <div id="s_radar" class="sensor">🛰️ Contactos de Radar
+                <span id="data_radar" class="datos-estructurados">Escaneando...</span>
+            </div>
+            <div id="s_eventos" class="sensor">📦 Evento JSON Transmitido (MQTT)
+                <span id="data_eventos" class="datos-estructurados">Sin eventos recientes</span>
             </div>
         </div>
 
@@ -170,13 +338,13 @@ def pagina_principal():
             var latCentro = 7.128606, lonCentro = -73.181549;
             var map = L.map('map').setView([latCentro, lonCentro], 17);
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-            L.marker([latCentro, lonCentro]).addTo(map).bindPopup("Estación Multisensor");
+            L.circle([latCentro, lonCentro], {color: 'red', fillColor: '#f03', fillOpacity: 0.1, radius: 125}).addTo(map);
 
             var dronMarker = null;
+            var aveMarker = null;
             var radarLine = null;
             var radarVisualAngle = 0;
 
-            // Motor visual del radar (corre a 60fps independientemente del polling)
             function getDestinoRadar(azimut_grados, distancia_m) {
                 var R = 6378137;
                 var brng = azimut_grados * Math.PI / 180;
@@ -187,10 +355,10 @@ def pagina_principal():
             }
 
             setInterval(() => {
-                radarVisualAngle = (radarVisualAngle + (120 * 0.05)) % 360; // 120 grados por segundo
+                radarVisualAngle = (radarVisualAngle + (120 * 0.05)) % 360;
                 var borde = getDestinoRadar(radarVisualAngle, 120);
                 if(!radarLine) {
-                    radarLine = L.polyline([[latCentro, lonCentro], borde], {color: '#00ff00', weight: 3, opacity: 0.6}).addTo(map);
+                    radarLine = L.polyline([[latCentro, lonCentro], borde], {color: '#00ff00', weight: 2, opacity: 0.5}).addTo(map);
                 } else {
                     radarLine.setLatLngs([[latCentro, lonCentro], borde]);
                 }
@@ -201,40 +369,45 @@ def pagina_principal():
                 fetch("/iniciar/" + tipo, { method: "POST" });
             }
 
-            // Polling de telemetría (Estado y detección real del backend)
             setInterval(() => {
                 fetch("/estado").then(r => r.json()).then(data => {
-                    if (data.volando) {
-                        if (!dronMarker) { dronMarker = L.marker([data.lat, data.lon]).addTo(map); }
-                        else { dronMarker.setLatLng([data.lat, data.lon]); }
-                        
-                        actualizarUI("s_rf", "data_rf", data.sensores.RF.detectado, 
-                            data.sensores.RF.detectado ? `ALERTA RF DETECTADA<br>RSSI Estimado: ${data.sensores.RF.rssi} dBm` : `Buscando señales...<br>RSSI de Fondo: ${data.sensores.RF.rssi} dBm`);
-                        
-                        actualizarUI("s_radar", "data_radar", data.sensores.Radar.detectado,
-                            data.sensores.Radar.detectado ? `ECO CONFIRMADO<br>Rango: ${data.sensores.Radar.distancia}m | Azimut: ${data.sensores.Radar.azimut}°` : `Escaneando espacio aéreo...<br>Sin contactos en el barrido.`);
-                            
-                        actualizarUI("s_audio", "data_audio", data.sensores.Audio.detectado,
-                            data.sensores.Audio.detectado ? `RUIDO DE MOTORES<br>Nivel: ${data.sensores.Audio.spl} dB | Fondo: ${data.sensores.Audio.ambiente} dB` : `Monitoreando...<br>Ambiente: ${data.sensores.Audio.ambiente} dB`);
-                            
-                        actualizarUI("s_camara", "data_camara", data.sensores.Camara.detectado,
-                            data.sensores.Camara.detectado ? `OBJETIVO EN CAMPO DE VISIÓN` : `FOV Despejado`);
-                    } else {
-                        if (dronMarker) { map.removeLayer(dronMarker); dronMarker = null; }
-                        actualizarUI("s_rf", "data_rf", false, "Buscando señales...");
-                        actualizarUI("s_radar", "data_radar", false, "Escaneando espacio aéreo...");
-                        actualizarUI("s_audio", "data_audio", false, "Monitoreando SPL...");
-                        actualizarUI("s_camara", "data_camara", false, "FOV Despejado");
+                    let s = data.sensores;
+
+                    if (data.ave && data.ave.activa) {
+                        if (!aveMarker) {
+                            let birdIcon = L.divIcon({className: 'custom-div-icon', html: "<div style='background-color:#f39c12; width:10px; height:10px; border-radius:50%;'></div>", iconSize: [10, 10]});
+                            aveMarker = L.marker([data.ave.lat, data.ave.lon], {icon: birdIcon}).addTo(map).bindPopup("Ave");
+                        } else {
+                            aveMarker.setLatLng([data.ave.lat, data.ave.lon]);
+                        }
+                    } else if (aveMarker) {
+                        map.removeLayer(aveMarker);
+                        aveMarker = null;
                     }
+
+                    if (data.volando) {
+                        if (!dronMarker) { dronMarker = L.marker([data.lat, data.lon]).addTo(map).bindPopup("Dron"); }
+                        else { dronMarker.setLatLng([data.lat, data.lon]); }
+                    } else if (dronMarker) {
+                        map.removeLayer(dronMarker);
+                        dronMarker = null;
+                    }
+
+                    let camText = s.Camara.length > 0 ? s.Camara.map(c => `Clasificación: <span class="highlight">${c.classification.toUpperCase()}</span> (ID: ${c.object_id})`).join("<br>") : "Sin objetivos en rango de visión (70m)";
+                    document.getElementById("data_camara").innerHTML = camText;
+
+                    document.getElementById("data_audio").innerText = `Nivel SPL: ${s.Audio.spl} dB SPL\\nPiso Ambiente: ${s.Audio.ambiente} dB SPL\\nEstado: ${s.Audio.detectado ? '¡Firma acústica de motor detectada!' : 'Sin firma de motor'}`;
+
+                    document.getElementById("data_rf").innerText = `Frecuencia: 2437.5 MHz\\nRSSI Actual: ${s.RF.rssi} dBm\\nPiso Ruido : ${s.RF.piso_ruido} dBm`;
+                    
+                    let radarText = s.Radar.length > 0 ? s.Radar.map(e => `[ID: ${e.id}] Rango: ${e.distancia}m, Azimut: ${e.azimut}°`).join("\\n") : "Sin contactos en barrido actual.";
+                    document.getElementById("data_radar").innerText = radarText;
+
+                    let eventText = data.eventos.length > 0 ? JSON.stringify(data.eventos[0], null, 2) : "Sin eventos recientes...";
+                    document.getElementById("data_eventos").innerText = eventText;
+
                 });
             }, 500);
-
-            function actualizarUI(div_id, span_id, detectado, texto) {
-                let div = document.getElementById(div_id);
-                document.getElementById(span_id).innerHTML = texto;
-                if (detectado) { div.classList.add("detectado"); } 
-                else { div.classList.remove("detectado"); }
-            }
         </script>
     </body>
     </html>
